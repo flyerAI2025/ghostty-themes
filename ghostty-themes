@@ -1,0 +1,742 @@
+#!/usr/bin/env zsh
+# ─────────────────────────────────────────────────────────────────────────────
+# ghostty-themes — Interactive Ghostty theme selector with live preview (macOS)
+#
+#   • Unified list: Saved at top, Browse in the middle, Skipped at bottom
+#   • Real-time theme application while browsing
+#   • Ctrl-F to save, Ctrl-D to skip
+#   • Accurate code preview matching `ghostty +list-themes` output
+#   • Esc / Ctrl-C to cancel and restore original theme
+#
+# Requirements: macOS 13+, Ghostty 1.0+, fzf 0.44+
+# License:      MIT
+# ─────────────────────────────────────────────────────────────────────────────
+
+readonly SELF="${0:A}"
+readonly VERSION="1.0.0"
+
+readonly GHOSTTY_APP_THEMES="/Applications/Ghostty.app/Contents/Resources/ghostty/themes"
+readonly GHOSTTY_CONFIG_DIR="$HOME/Library/Application Support/com.mitchellh.ghostty"
+readonly FAVORITES_FILE="$GHOSTTY_CONFIG_DIR/theme-favorites"
+readonly SKIPPED_FILE="$GHOSTTY_CONFIG_DIR/theme-skipped"
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+force_theme_colors() {
+  unset NO_COLOR
+  export COLORTERM=truecolor
+  export CLICOLOR_FORCE=1
+}
+
+ensure_config_dir() { [[ -d "$GHOSTTY_CONFIG_DIR" ]] || mkdir -p "$GHOSTTY_CONFIG_DIR"; }
+
+config_path() { print -r -- "${GHOSTTY_CONFIG:-$GHOSTTY_CONFIG_DIR/config}"; }
+
+picker_mode() {
+  case "${GHOSTTY_THEMES_UI_MODE:-auto}" in
+    panel|fullscreen)
+      print -r -- "$GHOSTTY_THEMES_UI_MODE"
+      ;;
+    auto)
+      print fullscreen
+      ;;
+    *)
+      print fullscreen
+      ;;
+  esac
+}
+
+preview_window_spec() {
+  local cols="${1:-${COLUMNS:-120}}"
+  local ratio="55%"
+
+  if (( cols <= 110 )); then
+    ratio="62%"
+  elif (( cols <= 140 )); then
+    ratio="58%"
+  fi
+
+  print -r -- "right:${ratio}"
+}
+
+reload_mode() {
+  case "${GHOSTTY_THEMES_RELOAD_MODE:-auto}" in
+    auto|script|shortcut)
+      print -r -- "${GHOSTTY_THEMES_RELOAD_MODE:-auto}"
+      ;;
+    *)
+      print auto
+      ;;
+  esac
+}
+
+# Atomically replace file content via temp file + mv (same-filesystem guarantee)
+atomic_filter() {
+  local target="$1"; shift
+  local tmp
+  tmp="$(mktemp "${target}.XXXXXX")" || return 1
+  { "$@" || true; } > "$tmp"
+  mv -- "$tmp" "$target" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+}
+
+reload_config_via_script() {
+  local result
+  result="$(
+    osascript 2>/dev/null <<'APPLESCRIPT'
+tell application "Ghostty"
+  if (count of windows) is 0 then return false
+  return perform action "reload_config" on focused terminal of selected tab of front window
+end tell
+APPLESCRIPT
+  )" || return 1
+  [[ "$result" == "true" ]]
+}
+
+reload_config_via_shortcut() {
+  osascript -e 'tell application "System Events" to keystroke "," using {command down, shift down}' \
+    >/dev/null 2>&1
+}
+
+reload_ghostty_config() {
+  case "$(reload_mode)" in
+    script)
+      reload_config_via_script
+      ;;
+    shortcut)
+      reload_config_via_shortcut
+      ;;
+    auto)
+      reload_config_via_script && return 0
+      reload_config_via_shortcut
+      ;;
+  esac
+}
+
+find_theme() {
+  local name="$1"
+  [[ "$name" == */* ]] && return 1
+  local dir
+  for dir in "$GHOSTTY_CONFIG_DIR/themes" \
+             "${GHOSTTY_RESOURCES_DIR:+$GHOSTTY_RESOURCES_DIR/themes}" \
+             "$GHOSTTY_APP_THEMES"; do
+    [[ -n "$dir" && -f "$dir/$name" ]] && { print -r -- "$dir/$name"; return 0; }
+  done
+  return 1
+}
+
+# ── Theme File Parsing ───────────────────────────────────────────────────────
+
+parse_theme() {
+  local file="$1"
+  typeset -gA PAL=()
+  typeset -g TBG="#000000" TFG="#ffffff"
+  typeset -g TCUR="" TCURTXT="" TSELBG="" TSELFG=""
+
+  local line k v
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    k="${line%% =*}"; k="${k//[[:space:]]/}"
+    v="${line##*= }"; v="${v//[[:space:]]/}"
+    case "$k" in
+      palette)              PAL[${v%%=*}]="${v##*=}" ;;
+      background)           TBG="$v" ;;
+      foreground)           TFG="$v" ;;
+      cursor-color)         TCUR="$v" ;;
+      cursor-text)          TCURTXT="$v" ;;
+      selection-background) TSELBG="$v" ;;
+      selection-foreground) TSELFG="$v" ;;
+    esac
+  done < "$file"
+
+  : ${TCUR:=$TFG}; : ${TCURTXT:=$TBG}
+  : ${TSELBG:=$TFG}; : ${TSELFG:=$TBG}
+}
+
+# ── ANSI Color Helpers ───────────────────────────────────────────────────────
+# _fg_v / _bg_v write result to REPLY without forking — critical for preview speed.
+
+_fg_v() {
+  local h="${1#\#}"
+  [[ ${#h} -ge 6 ]] || { REPLY=""; return 1; }
+  REPLY=$'\033[38;2;'"$((16#${h:0:2}));$((16#${h:2:2}));$((16#${h:4:2}))"'m'
+}
+
+_bg_v() {
+  local h="${1#\#}"
+  [[ ${#h} -ge 6 ]] || { REPLY=""; return 1; }
+  REPLY=$'\033[48;2;'"$((16#${h:0:2}));$((16#${h:2:2}));$((16#${h:4:2}))"'m'
+}
+
+contrast_fg_v() {
+  local h="${1#\#}"
+  [[ ${#h} -ge 6 ]] || { REPLY=$'\033[38;2;245;245;245m'; return 1; }
+  local r=$((16#${h:0:2}))
+  local g=$((16#${h:2:2}))
+  local b=$((16#${h:4:2}))
+  local y=$(( (r * 299 + g * 587 + b * 114) / 1000 ))
+  if (( y >= 150 )); then
+    REPLY=$'\033[38;2;23;24;26m'
+  else
+    REPLY=$'\033[38;2;248;248;248m'
+  fi
+}
+
+# ── Saved / Skipped Management ───────────────────────────────────────────────
+
+list_add() {
+  local file="$1" name="$2"
+  [[ -z "$name" ]] && return 1
+  ensure_config_dir
+  [[ -f "$file" ]] || touch "$file"
+  grep -qxF "$name" "$file" 2>/dev/null || printf '%s\n' "$name" >> "$file"
+  list_normalize "$file"
+}
+
+list_remove() {
+  local file="$1" name="$2"
+  [[ -z "$name" || ! -f "$file" ]] && return 0
+  atomic_filter "$file" grep -vxF "$name" "$file"
+  list_normalize "$file"
+}
+
+list_has() {
+  local file="$1" name="$2"
+  [[ -f "$file" ]] && grep -qxF "$name" "$file" 2>/dev/null
+}
+
+list_normalize() {
+  local file="$1" name
+  [[ -f "$file" ]] || return 0
+
+  local -a items=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && items+=("$name")
+  done < "$file"
+
+  local tmp
+  tmp="$(mktemp "${file}.XXXXXX")" || return 1
+  { (( ${#items[@]} )) && print -l -- ${(ou)items[@]}; } > "$tmp"
+  mv -- "$tmp" "$file" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+}
+
+list_print_sorted() {
+  local file="$1" name
+  [[ -f "$file" ]] || return 0
+
+  local -a items=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && items+=("$name")
+  done < "$file"
+
+  (( ${#items[@]} )) && print -l -- ${(ou)items[@]}
+}
+
+list_count() {
+  local file="$1"
+  [[ -f "$file" ]] || { print 0; return; }
+  local c
+  c=$(grep -c '.' "$file" 2>/dev/null) || true
+  print "${c:-0}"
+}
+
+cmd_add_fav() {
+  local name="$*"
+  [[ -z "$name" ]] && return 1
+  cmd_rm_skip "$name"
+  list_add "$FAVORITES_FILE" "$name"
+}
+
+cmd_rm_fav() {
+  local name="$*"
+  list_remove "$FAVORITES_FILE" "$name"
+}
+
+cmd_add_skip() {
+  local name="$*"
+  [[ -z "$name" ]] && return 1
+  cmd_rm_fav "$name"
+  list_add "$SKIPPED_FILE" "$name"
+}
+
+cmd_rm_skip() {
+  local name="$*"
+  list_remove "$SKIPPED_FILE" "$name"
+}
+
+is_fav() { list_has "$FAVORITES_FILE" "$1"; }
+is_skip() { list_has "$SKIPPED_FILE" "$1"; }
+
+fav_count() { list_count "$FAVORITES_FILE"; }
+skip_count() { list_count "$SKIPPED_FILE"; }
+
+# ── Theme Listing ───────────────────────────────────────────────────────────
+
+all_themes() {
+  local -a themes=()
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && themes+=("$name")
+  done < <(ghostty +list-themes 2>/dev/null | sed -E 's/ \((resources|user)\)$//')
+  print -l -- ${(ou)themes[@]}
+}
+
+cmd_list_combined() {
+  force_theme_colors
+  local DIM=$'\033[2m' YELL=$'\033[33m' RED=$'\033[31m' STRIKE=$'\033[9m' R=$'\033[0m'
+  local -a saved=() browse=() skipped=()
+  local name
+  typeset -A saved_set skipped_set
+
+  if [[ -f "$FAVORITES_FILE" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && saved_set[$name]=1
+    done < "$FAVORITES_FILE"
+  fi
+
+  if [[ -f "$SKIPPED_FILE" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && skipped_set[$name]=1
+    done < "$SKIPPED_FILE"
+  fi
+
+  while IFS= read -r name; do
+    if (( ${saved_set[$name]:-0} )); then
+      saved+=("$name")
+    elif (( ${skipped_set[$name]:-0} )); then
+      skipped+=("$name")
+    else
+      browse+=("$name")
+    fi
+  done < <(all_themes)
+
+  for name in "${saved[@]}"; do
+    printf 'saved\t%s\t%s★%s %s\n' "$name" "$YELL" "$R" "$name"
+  done
+
+  for name in "${browse[@]}"; do
+    printf 'browse\t%s\t%s\n' "$name" "$name"
+  done
+
+  for name in "${skipped[@]}"; do
+    printf 'skip\t%s\t%s⊘%s %s%s%s\n' "$name" "$RED" "$R" "$DIM$STRIKE" "$name" "$R"
+  done
+}
+
+cmd_list_fav() {
+  list_print_sorted "$FAVORITES_FILE"
+}
+
+cmd_list_skip() {
+  list_print_sorted "$SKIPPED_FILE"
+}
+
+combined_name_at_pos() {
+  local target="$1"
+  [[ "$target" == <-> ]] || return 1
+
+  local query="${FZF_QUERY:-}"
+  local i=0 lane name _
+  if [[ -n "$query" ]] && command -v fzf >/dev/null; then
+    while IFS=$'\t' read -r lane name _; do
+      (( i += 1 ))
+      if (( i == target )); then
+        print -r -- "$name"
+        return 0
+      fi
+    done < <(
+      cmd_list_combined |
+      fzf \
+        --ansi \
+        --filter="$query" \
+        --delimiter=$'\t' \
+        --with-nth=3 \
+        --tiebreak=index
+    )
+  else
+    while IFS=$'\t' read -r lane name _; do
+      (( i += 1 ))
+      if (( i == target )); then
+        print -r -- "$name"
+        return 0
+      fi
+    done < <(cmd_list_combined)
+  fi
+
+  return 1
+}
+
+# ── Preview Renderer ─────────────────────────────────────────────────────────
+
+cmd_preview() {
+  force_theme_colors
+  local raw="$*"
+
+  if [[ -z "$raw" ]]; then
+    local D=$'\033[2m' C=$'\033[36m' R=$'\033[0m'
+    print "\n  ${D}No theme selected${R}"
+    print "  ${D}Type to search, or clear the filter${R}\n"
+    print "  ${C}^F${R}      save theme"
+    print "  ${C}^D${R}      skip theme"
+    print "  ${C}Enter${R}   apply theme + exit"
+    print "  ${C}Esc/^C${R}  restore original + exit"
+    return 0
+  fi
+
+  local name="$raw"
+  local file
+  file="$(find_theme "$name")" || { print -u2 "Theme not found: $name"; return 1; }
+  parse_theme "$file"
+
+  local R=$'\033[0m' BOLD=$'\033[1m' UL=$'\033[4m'
+  local DIM=$'\033[2m' ITALIC=$'\033[3m' STRIKE=$'\033[9m'
+  local G=$'\033[38;5;238m'
+
+  # Precompute all ANSI colors via REPLY — zero subshell forks
+  _bg_v "$TBG"; local BG="$REPLY"
+  _fg_v "$TFG"; local FG="$REPLY"
+  local S="${BG}${FG}"
+
+  _fg_v "${PAL[1]:-$TFG}";  local C1="$REPLY"
+  _fg_v "${PAL[2]:-$TFG}";  local C2="$REPLY"
+  _fg_v "${PAL[3]:-$TFG}";  local C3="$REPLY"
+  _fg_v "${PAL[4]:-$TFG}";  local C4="$REPLY"
+  _fg_v "${PAL[5]:-$TFG}";  local C5="$REPLY"
+  _fg_v "${PAL[6]:-$TFG}";  local C6="$REPLY"
+  _fg_v "${PAL[10]:-$TFG}"; local C10="$REPLY"
+  _fg_v "${PAL[12]:-$TFG}"; local C12="$REPLY"
+
+  _fg_v "$TSELFG"; local sf="$REPLY"; _bg_v "$TSELBG"; local SEL="${sf}${REPLY}"
+  _fg_v "$TCURTXT"; local ct="$REPLY"; _bg_v "$TCUR";  local CUR="${ct}${REPLY}"
+
+  # Precompute gutter strings via zsh padding — zero subshell forks
+  local -a GT=()
+  local i
+  for i in {1..17}; do
+    GT+=("${G}${(l:4:)i}   ${C6}│${S}")
+  done
+
+  _pl() { printf '%s%s%s\n' "$BG" "$*" "$R"; }
+  _chip() {
+    local hex="$1" label="$2"
+    [[ -n "$hex" ]] || { printf '%s    %s' "$S" "$R"; return 0; }
+    _bg_v "$hex"; local chip_bg="$REPLY"
+    contrast_fg_v "$hex"; local chip_fg="$REPLY"
+    printf '%s%s %s %s' "$chip_bg" "$chip_fg" "$label" "$R$S"
+  }
+
+  # ── File header (bat-style) ──
+  _pl "${C2}→${S} ${C4}bat${S} ${C6}${UL}ziggzagg.zig${R}"
+
+  # ── Code: ziggzagg.zig ──
+  _pl "${GT[1]} ${C5}const${S} std ${C5}= @import${S}(${C10}\"std\"${S});"
+  _pl "${GT[2]}"
+  _pl "${GT[3]} ${C5}pub ${S}${C12}fn ${S}${C2}main${S}() ${C5}!${S}${C12}void${S} {"
+  _pl "${GT[4]}     ${C5}const${S} stdout ${C5}=${S} std.io.getStdOut().writer();"
+  _pl "${GT[5]}     ${C5}var${S} i: ${C12}usize${S} ${C5}=${S} ${C4}1${S};"
+  _pl "${GT[6]}     ${C5}while${S} (i ${C5}<=${S} ${C4}16${S}) : (i ${C5}+=${S} ${C4}1${S}) {"
+  _pl "${GT[7]}         ${C5}if${S} (i ${C5}%${S} ${C4}15${S} ${C5}==${S} ${C4}0${S}) {"
+  _pl "${GT[8]}             ${C5}try${S} stdout.writeAll(${C10}\"ZiggZagg${C12}\\n${C10}\"${S});"
+  _pl "${GT[9]}         } ${C5}else if${S} (i ${C5}%${S} ${C4}3${S} ${C5}==${S} ${C4}0${S}) {"
+  _pl "${GT[10]}             ${C5}try${S} stdout.writeAll(${C10}\"Zigg${C12}\\n${C10}\"${S});"
+  _pl "${GT[11]}         } ${C5}else if${S} (i ${C5}%${S} ${C4}5${S} ${C5}==${S} ${C4}0${S}) {"
+  _pl "${GT[12]}             ${C5}try${S} stdout.writeAll(${C10}\"Zagg${C12}\\n${C10}\"${S});"
+  _pl "${GT[13]}         } ${C5}else${S} {"
+  _pl "${GT[14]}             ${C5}try${S} stdout.print(${C10}\"{d}${C12}\\n${C10}\",${S} .{i});"
+  _pl "${GT[15]}         }"
+  _pl "${GT[16]}     }"
+  _pl "${GT[17]} }"
+
+  # ── Separator ──
+  local fill=$(( ${FZF_PREVIEW_COLUMNS:-80} - 8 ))
+  (( fill < 1 )) && fill=72
+  _pl "${G}───────┴$(printf '─%.0s' {1..$fill})"
+
+  # ── Shell prompt ──
+  _pl "${C6}ghostty${S} • ${C4}main${S} ${C1}[+]${S} • ${C3}v0.13${S} • ${C4}impure${S} • ${C3}10:36${S} ${C2}→"
+
+  # ── Palette chips (2 rows × 8 colors) ──
+  local pc row
+  for row in 0 8; do
+    printf '%s  ' "$S"
+    for (( i = row; i <= row + 7; i++ )); do
+      pc="${PAL[$i]:-}"
+      _chip "$pc" "$(printf '%X' "$i")"
+      printf ' '
+    done
+    printf '%s\n' "$R"
+  done
+
+  printf '%s  ' "$S"
+  _chip "${PAL[1]:-$TFG}" "ER"
+  printf ' '
+  _chip "${PAL[2]:-$TFG}" "OK"
+  printf ' '
+  _chip "${PAL[3]:-$TFG}" "HI"
+  printf ' '
+  _chip "${PAL[4]:-$TFG}" "IN"
+  printf ' '
+  _chip "${PAL[5]:-$TFG}" "AC"
+  printf ' '
+  _chip "$TSELBG" "SE"
+  printf ' '
+  _chip "$TCUR" "CU"
+  printf '%s\n' "$R"
+
+  # ── Text styles ──
+  printf '%s  normal  %sbold%s  %sdim%s  %sitalic%s  %sunderline%s%s\n' \
+    "$S" "$BOLD" "$R$S" "$DIM" "$R$S" "$ITALIC" "$R$S" "$UL" "$R$S" "$R"
+
+  # ── Status Panel ──
+  local CYAN=$'\033[36m' YELL=$'\033[33m' RED=$'\033[31m'
+  local pw=${FZF_PREVIEW_COLUMNS:-80}
+  local fav_n=$(fav_count)
+  local skip_n=$(skip_count)
+
+  printf '\n%s' "$DIM"
+  printf '─%.0s' {1..$pw}
+  printf '%s\n' "$R"
+
+  printf '  '
+  if is_fav "$name"; then
+    _chip "${PAL[3]:-${PAL[11]:-$TFG}}" "SV"
+    printf '%s saved' "$YELL"
+  elif is_skip "$name"; then
+    _chip "${PAL[1]:-$TFG}" "SK"
+    printf '%s skipped%s  %s%s%s' "$RED" "$R" "$DIM$STRIKE" "$name" "$R"
+  else
+    _chip "${PAL[8]:-$TFG}" "BR"
+    printf '%s browsing' "$DIM"
+  fi
+  printf '%s  %s•%s  %s%d%s saved  %s•%s  %s%d%s skipped\n' \
+    "$R" "$DIM" "$R" "$CYAN" "$fav_n" "$R" "$DIM" "$R" "$CYAN" "$skip_n" "$R"
+
+  (( fav_n < 2 || skip_n < 2 )) && printf '  %s↑ saved to top  •  ↓ skipped to bottom%s\n' "$DIM" "$R"
+
+  printf '\n  %s↑/↓%s browse  %s•%s  type filter\n' \
+    "$CYAN" "$R" "$DIM" "$R"
+  printf '  %s^F%s save  %s•%s  %s^D%s skip\n' \
+    "$CYAN" "$R" "$DIM" "$R" "$CYAN" "$R"
+  printf '  %sEnter%s apply  %s•%s  %sEsc%s restore\n' \
+    "$CYAN" "$R" "$DIM" "$R" "$CYAN" "$R"
+
+  # ── Footer ──
+  printf '\n  %sv%s  •  github.com/flyerAI2025/ghostty-themes%s\n' "$DIM" "$VERSION" "$R"
+}
+
+# ── Theme Application ────────────────────────────────────────────────────────
+
+cmd_apply() {
+  local name="$*"
+  local config
+  config="$(config_path)"
+
+  ensure_config_dir
+  [[ -f "$config" ]] || touch "$config"
+
+  # Skip if already applied — avoids redundant I/O during rapid browsing
+  local current
+  current=$(grep -m1 '^theme *=' "$config" 2>/dev/null | sed 's/^theme *= *//')
+  [[ "$current" == "$name" ]] && return 0
+
+  if [[ -z "$name" ]]; then
+    # Remove theme line
+    grep -q '^theme *=' "$config" 2>/dev/null &&
+      atomic_filter "$config" grep -v '^theme *=' "$config"
+  elif grep -q '^theme *=' "$config" 2>/dev/null; then
+    # Replace existing theme line
+    THEME_NAME="$name" atomic_filter "$config" awk \
+      '{if(/^theme *=/){print "theme = " ENVIRON["THEME_NAME"]}else{print}}' "$config"
+  else
+    printf 'theme = %s\n' "$name" >> "$config"
+  fi
+
+  reload_ghostty_config || true
+}
+
+# ── Mark Toggle Handler ─────────────────────────────────────────────────────
+
+cmd_toggle_mark() {
+  local action="$1" index="$2"
+  if [[ "$index" == <-> ]]; then
+    shift 2
+  else
+    index=0
+    shift
+  fi
+  local name="$*"
+  [[ -z "$name" ]] && { print -r -- "refresh-preview"; return 0; }
+  local was_fav=0 was_skip=0
+  is_fav "$name" && was_fav=1
+  is_skip "$name" && was_skip=1
+  local pos=$index
+
+  case "$action" in
+    save)
+      if (( was_fav )); then
+        cmd_rm_fav "$name"
+      else
+        cmd_add_fav "$name"
+        pos=$(( index + 1 ))
+      fi
+      ;;
+    skip)
+      if (( was_skip )); then
+        cmd_rm_skip "$name"
+      else
+        cmd_add_skip "$name"
+      fi
+      ;;
+  esac
+
+  (( pos < 1 )) && pos=1
+  local next_name
+  next_name="$(combined_name_at_pos "$pos")" || next_name=""
+  [[ -n "$next_name" ]] && cmd_apply "$next_name"
+  print -r -- "reload('$SELF' --list-combined)+pos($pos)+refresh-preview"
+}
+
+# ── Interactive Selector ─────────────────────────────────────────────────────
+
+cmd_main() {
+  force_theme_colors
+  command -v fzf     >/dev/null || { print -u2 "fzf not found. Install: brew install fzf"; return 1; }
+  command -v ghostty >/dev/null || { print -u2 "ghostty not found. See https://ghostty.org"; return 1; }
+
+  # fzf 0.44+ required for the interactive bindings used below
+  local fzf_ver
+  fzf_ver=$(fzf --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  if [[ -n "$fzf_ver" ]]; then
+    local major=${fzf_ver%%.*} minor=${fzf_ver#*.}
+    if (( major == 0 && minor < 44 )); then
+      print -u2 "fzf 0.44+ required (found $fzf_ver). Run: brew upgrade fzf"
+      return 1
+    fi
+  fi
+
+  local config
+  config="$(config_path)"
+
+  ensure_config_dir
+  [[ -f "$config" ]] || touch "$config"
+  [[ -f "$FAVORITES_FILE" ]] || touch "$FAVORITES_FILE"
+  [[ -f "$SKIPPED_FILE" ]] || touch "$SKIPPED_FILE"
+
+  local original
+  original=$(grep -m1 '^theme *=' "$config" 2>/dev/null | sed 's/^theme *= *//')
+  local escaped_original="${original//\'/\'\\\'\'}"
+  local mode
+  mode="$(picker_mode)"
+  local preview_window
+  preview_window="$(preview_window_spec "${COLUMNS:-120}")"
+  local -a fzf_opts=(
+    --ansi
+    --layout=reverse
+    --cycle
+    --tiebreak=index
+    --delimiter=$'\t'
+    --with-nth=3
+    --accept-nth=2
+    --prompt="Theme > "
+    --header=""
+    --preview="'$SELF' --preview {2}"
+    --bind="focus:execute-silent(n={2}; [ -n \"\$n\" ] && '$SELF' --apply \"\$n\")"
+    --bind="ctrl-f:transform:pos=\${FZF_POS:-1}; '$SELF' --toggle-mark save \"\$pos\" {2}"
+    --bind="ctrl-d:transform:pos=\${FZF_POS:-1}; '$SELF' --toggle-mark skip \"\$pos\" {2}"
+    --bind="esc:execute-silent('$SELF' --apply '${escaped_original}')+abort"
+    --bind="ctrl-c:execute-silent('$SELF' --apply '${escaped_original}')+abort"
+  )
+
+  if [[ "$mode" == panel ]]; then
+    fzf_opts+=(
+      --height=-2
+      --border=rounded
+      --preview-window="${preview_window},border-left"
+      --info=inline-right
+    )
+  else
+    fzf_opts+=(
+      --preview-window="$preview_window"
+    )
+  fi
+
+  # Restore original theme on unexpected termination
+  trap "cmd_apply '${escaped_original}' 2>/dev/null" INT TERM HUP
+
+  local selected
+  selected=$(
+    "$SELF" --list-combined | fzf "${fzf_opts[@]}"
+  )
+
+  trap - INT TERM HUP
+
+  if [[ -n "$selected" ]]; then
+    cmd_apply "$selected"
+    print "Theme applied: $selected"
+  else
+    [[ -n "$original" ]] && cmd_apply "$original"
+    print "Cancelled, restored: ${original:-default}"
+  fi
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+  cat <<EOF
+ghostty-themes $VERSION — Interactive Ghostty theme selector with live preview (macOS)
+
+Usage:
+  ghostty-themes                       Launch interactive selector
+  ghostty-themes --preview <name>      Render theme preview (used by fzf)
+  ghostty-themes --apply <name>        Apply theme and reload Ghostty
+  ghostty-themes --version             Show version
+  ghostty-themes --help                Show this help
+
+Saved:
+  ghostty-themes --save <name>         Save a theme
+  ghostty-themes --unsave <name>       Remove a saved theme
+  ghostty-themes --list-saved          List saved themes
+
+Skipped:
+  ghostty-themes --skip <name>         Skip a theme
+  ghostty-themes --unskip <name>       Remove a skipped theme
+  ghostty-themes --list-skipped        List skipped themes
+
+Compatibility:
+  ghostty-themes --add-fav <name>      Legacy alias for --save
+  ghostty-themes --rm-fav <name>       Legacy alias for --unsave
+  ghostty-themes --list-fav            Legacy alias for --list-saved
+
+Environment:
+  GHOSTTY_CONFIG            Override Ghostty config file path (auto-detected by default)
+  GHOSTTY_THEMES_UI_MODE    Picker UI mode: auto | fullscreen | panel (manual fallback)
+  GHOSTTY_THEMES_RELOAD_MODE Reload mode: auto | script | shortcut
+
+Controls (inside fzf):
+  ↑/↓       Navigate (Saved at top, Browse in the middle, Skipped at bottom)
+  Ctrl-F     Save / unsave theme
+  Ctrl-D     Skip / unskip theme
+  Enter      Apply theme + exit
+  Esc        Cancel and restore original theme
+  Ctrl-C     Cancel and restore original theme
+  Type       Fuzzy search / filter
+EOF
+}
+
+case "${1:-}" in
+  --preview)        shift; cmd_preview "$*" ;;
+  --apply)          shift; cmd_apply "$*" ;;
+  --list-combined)  cmd_list_combined ;;
+  --list-saved)     cmd_list_fav ;;
+  --list-fav)       cmd_list_fav ;;
+  --list-skipped|--list-skip) cmd_list_skip ;;
+  --save)           shift; cmd_add_fav "$*" ;;
+  --unsave)         shift; cmd_rm_fav "$*" ;;
+  --add-fav)        shift; cmd_add_fav "$*" ;;
+  --rm-fav)         shift; cmd_rm_fav "$*" ;;
+  --skip)           shift; cmd_add_skip "$*" ;;
+  --unskip)         shift; cmd_rm_skip "$*" ;;
+  --toggle-mark)    shift; cmd_toggle_mark "$@" ;;
+  --help|-h)        cmd_help ;;
+  --version)        print "ghostty-themes $VERSION" ;;
+  *)                cmd_main ;;
+esac

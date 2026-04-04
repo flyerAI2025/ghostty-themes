@@ -1,0 +1,11 @@
+.DS_Store
+*.swp
+*.tmp
+*.tmp.*
+*.mov
+*.mp4
+*.webm
+.demo-work/
+.agents.local.md
+.codex/config.toml
+.claude/
