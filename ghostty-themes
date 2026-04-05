@@ -19,6 +19,7 @@ readonly GHOSTTY_APP_THEMES="/Applications/Ghostty.app/Contents/Resources/ghostt
 readonly GHOSTTY_CONFIG_DIR="$HOME/Library/Application Support/com.mitchellh.ghostty"
 readonly FAVORITES_FILE="$GHOSTTY_CONFIG_DIR/theme-favorites"
 readonly SKIPPED_FILE="$GHOSTTY_CONFIG_DIR/theme-skipped"
+readonly USAGE_FILE="$GHOSTTY_CONFIG_DIR/theme-usage"
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -152,6 +153,38 @@ parse_theme() {
   : ${TSELBG:=$TFG}; : ${TSELFG:=$TBG}
 }
 
+theme_luma() {
+  local h="${1#\#}"
+  [[ ${#h} -ge 6 ]] || { print 0; return 1; }
+  local r=$((16#${h:0:2}))
+  local g=$((16#${h:2:2}))
+  local b=$((16#${h:4:2}))
+  print $(( (r * 299 + g * 587 + b * 114) / 1000 ))
+}
+
+theme_appearance() {
+  local name="$*"
+  [[ -n "$name" ]] || return 1
+
+  local file
+  file="$(find_theme "$name")" || return 1
+  parse_theme "$file"
+
+  local bg fg
+  bg="$(theme_luma "$TBG")" || bg=0
+  fg="$(theme_luma "$TFG")" || fg=255
+
+  if (( bg > fg )); then
+    print light
+  elif (( bg < fg )); then
+    print dark
+  elif (( bg >= 128 )); then
+    print light
+  else
+    print dark
+  fi
+}
+
 # ── ANSI Color Helpers ───────────────────────────────────────────────────────
 # _fg_v / _bg_v write result to REPLY without forking — critical for preview speed.
 
@@ -237,6 +270,100 @@ list_count() {
   local c
   c=$(grep -c '.' "$file" 2>/dev/null) || true
   print "${c:-0}"
+}
+
+usage_count() {
+  local target="$1" name count
+  [[ -f "$USAGE_FILE" ]] || { print 0; return; }
+
+  while IFS=$'\t' read -r name count; do
+    [[ "$name" == "$target" ]] && { print "${count:-0}"; return; }
+  done < "$USAGE_FILE"
+
+  print 0
+}
+
+usage_count_adjusted() {
+  local target="$1"
+  local count
+  count="$(usage_count "$target")"
+  [[ "$count" == <-> ]] || count=0
+
+  if [[ "${USAGE_COUNT_BONUS_NAME:-}" == "$target" && "${USAGE_COUNT_BONUS_DELTA:-0}" == <-> ]]; then
+    count=$(( count + USAGE_COUNT_BONUS_DELTA ))
+  fi
+
+  print "$count"
+}
+
+usage_increment() {
+  local target="$1"
+  [[ -n "$target" ]] || return 1
+
+  ensure_config_dir
+  [[ -f "$USAGE_FILE" ]] || touch "$USAGE_FILE"
+
+  local tmp name count found=0
+  tmp="$(mktemp "${USAGE_FILE}.XXXXXX")" || return 1
+
+  {
+    while IFS=$'\t' read -r name count; do
+      [[ -n "$name" ]] || continue
+      if [[ "$name" == "$target" ]]; then
+        count=$(( ${count:-0} + 1 ))
+        found=1
+      fi
+      printf '%s\t%s\n' "$name" "${count:-0}"
+    done < "$USAGE_FILE"
+
+    if (( ! found )); then
+      printf '%s\t1\n' "$target"
+    fi
+  } | LC_ALL=C sort -t $'\t' -k1,1 > "$tmp"
+
+  mv -- "$tmp" "$USAGE_FILE" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+}
+
+best_saved_theme_for_appearance() {
+  local wanted="$1"
+  [[ "$wanted" == light || "$wanted" == dark ]] || return 1
+  [[ -f "$FAVORITES_FILE" ]] || return 1
+
+  local name appearance count best="" best_count=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    appearance="$(theme_appearance "$name" 2>/dev/null)" || continue
+    [[ "$appearance" == "$wanted" ]] || continue
+    count="$(usage_count_adjusted "$name")"
+    [[ "$count" == <-> ]] || count=0
+    if (( count > best_count )); then
+      best="$name"
+      best_count=$count
+    fi
+  done < "$FAVORITES_FILE"
+
+  (( best_count > 0 )) || return 1
+  print -r -- "$best"
+}
+
+auto_theme_value() {
+  local light dark
+  light="$(best_saved_theme_for_appearance light)" || {
+    print -u2 "Auto theme unavailable: no saved light theme with usage history"
+    return 1
+  }
+  dark="$(best_saved_theme_for_appearance dark)" || {
+    print -u2 "Auto theme unavailable: no saved dark theme with usage history"
+    return 1
+  }
+  print -r -- "light:$light,dark:$dark"
+}
+
+auto_theme_value_for_selection() {
+  local name="$*"
+  [[ -n "$name" ]] || return 1
+  is_fav "$name" || return 1
+  auto_theme_value
 }
 
 cmd_add_fav() {
@@ -525,13 +652,15 @@ cmd_preview() {
 
 # ── Theme Application ────────────────────────────────────────────────────────
 
-cmd_apply() {
+apply_theme_value() {
   local name="$*"
   local config
   config="$(config_path)"
 
-  ensure_config_dir
-  [[ -f "$config" ]] || touch "$config"
+  ensure_config_dir || return 1
+  if [[ ! -f "$config" ]]; then
+    : > "$config" || return 1
+  fi
 
   # Skip if already applied — avoids redundant I/O during rapid browsing
   local current
@@ -541,16 +670,46 @@ cmd_apply() {
   if [[ -z "$name" ]]; then
     # Remove theme line
     grep -q '^theme *=' "$config" 2>/dev/null &&
-      atomic_filter "$config" grep -v '^theme *=' "$config"
+      atomic_filter "$config" grep -v '^theme *=' "$config" || return 1
   elif grep -q '^theme *=' "$config" 2>/dev/null; then
     # Replace existing theme line
     THEME_NAME="$name" atomic_filter "$config" awk \
-      '{if(/^theme *=/){print "theme = " ENVIRON["THEME_NAME"]}else{print}}' "$config"
+      '{if(/^theme *=/){print "theme = " ENVIRON["THEME_NAME"]}else{print}}' "$config" || return 1
   else
-    printf 'theme = %s\n' "$name" >> "$config"
+    printf 'theme = %s\n' "$name" >> "$config" || return 1
   fi
 
   reload_ghostty_config || true
+}
+
+cmd_apply_preview() {
+  apply_theme_value "$*"
+}
+
+cmd_apply() {
+  local name="$*"
+  local theme_exists=0
+  if [[ -n "$name" ]] && find_theme "$name" >/dev/null 2>&1; then
+    theme_exists=1
+  fi
+
+  local value="$name" auto_value
+  if (( theme_exists )); then
+    auto_value="$(
+      USAGE_COUNT_BONUS_NAME="$name" \
+      USAGE_COUNT_BONUS_DELTA=1 \
+      auto_theme_value_for_selection "$name" 2>/dev/null
+    )" && value="$auto_value"
+  fi
+  apply_theme_value "$value" || return 1
+  (( theme_exists )) && usage_increment "$name" || true
+}
+
+cmd_apply_auto() {
+  local value
+  value="$(auto_theme_value)" || return 1
+  apply_theme_value "$value"
+  print "Auto theme applied: $value"
 }
 
 # ── Mark Toggle Handler ─────────────────────────────────────────────────────
@@ -591,7 +750,7 @@ cmd_toggle_mark() {
   (( pos < 1 )) && pos=1
   local next_name
   next_name="$(combined_name_at_pos "$pos")" || next_name=""
-  [[ -n "$next_name" ]] && cmd_apply "$next_name"
+  [[ -n "$next_name" ]] && cmd_apply_preview "$next_name"
   print -r -- "reload('$SELF' --list-combined)+pos($pos)+refresh-preview"
 }
 
@@ -620,6 +779,7 @@ cmd_main() {
   [[ -f "$config" ]] || touch "$config"
   [[ -f "$FAVORITES_FILE" ]] || touch "$FAVORITES_FILE"
   [[ -f "$SKIPPED_FILE" ]] || touch "$SKIPPED_FILE"
+  [[ -f "$USAGE_FILE" ]] || touch "$USAGE_FILE"
 
   local original
   original=$(grep -m1 '^theme *=' "$config" 2>/dev/null | sed 's/^theme *= *//')
@@ -639,11 +799,11 @@ cmd_main() {
     --prompt="Theme > "
     --header=""
     --preview="'$SELF' --preview {2}"
-    --bind="focus:execute-silent(n={2}; [ -n \"\$n\" ] && '$SELF' --apply \"\$n\")"
+    --bind="focus:execute-silent(n={2}; [ -n \"\$n\" ] && '$SELF' --apply-preview \"\$n\")"
     --bind="ctrl-f:transform:pos=\${FZF_POS:-1}; '$SELF' --toggle-mark save \"\$pos\" {2}"
     --bind="ctrl-d:transform:pos=\${FZF_POS:-1}; '$SELF' --toggle-mark skip \"\$pos\" {2}"
-    --bind="esc:execute-silent('$SELF' --apply '${escaped_original}')+abort"
-    --bind="ctrl-c:execute-silent('$SELF' --apply '${escaped_original}')+abort"
+    --bind="esc:execute-silent('$SELF' --apply-preview '${escaped_original}')+abort"
+    --bind="ctrl-c:execute-silent('$SELF' --apply-preview '${escaped_original}')+abort"
   )
 
   if [[ "$mode" == panel ]]; then
@@ -660,7 +820,7 @@ cmd_main() {
   fi
 
   # Restore original theme on unexpected termination
-  trap "cmd_apply '${escaped_original}' 2>/dev/null" INT TERM HUP
+  trap "cmd_apply_preview '${escaped_original}' 2>/dev/null" INT TERM HUP
 
   local selected
   selected=$(
@@ -673,7 +833,7 @@ cmd_main() {
     cmd_apply "$selected"
     print "Theme applied: $selected"
   else
-    [[ -n "$original" ]] && cmd_apply "$original"
+    cmd_apply_preview "$original"
     print "Cancelled, restored: ${original:-default}"
   fi
 }
@@ -688,6 +848,7 @@ Usage:
   ghostty-themes                       Launch interactive selector
   ghostty-themes --preview <name>      Render theme preview (used by fzf)
   ghostty-themes --apply <name>        Apply theme and reload Ghostty
+  ghostty-themes --apply-auto          Apply native light/dark auto-switch from saved usage
   ghostty-themes --version             Show version
   ghostty-themes --help                Show this help
 
@@ -706,10 +867,20 @@ Compatibility:
   ghostty-themes --rm-fav <name>       Legacy alias for --unsave
   ghostty-themes --list-fav            Legacy alias for --list-saved
 
+Auto:
+  Saved themes applied with --apply or Enter automatically switch to
+  Ghostty's native light:...,dark:... pair once both sides have usage.
+  ghostty-themes --apply-auto          Use your most-used saved light and dark themes
+
 Environment:
   GHOSTTY_CONFIG            Override Ghostty config file path (auto-detected by default)
   GHOSTTY_THEMES_UI_MODE    Picker UI mode: auto | fullscreen | panel (manual fallback)
   GHOSTTY_THEMES_RELOAD_MODE Reload mode: auto | script | shortcut
+
+Notes:
+  Automatic light/dark switching only activates when you have both:
+  1. a saved light theme with usage history
+  2. a saved dark theme with usage history
 
 Controls (inside fzf):
   ↑/↓       Navigate (Saved at top, Browse in the middle, Skipped at bottom)
@@ -723,8 +894,10 @@ EOF
 }
 
 case "${1:-}" in
+  --apply-preview)  shift; cmd_apply_preview "$*" ;;
   --preview)        shift; cmd_preview "$*" ;;
   --apply)          shift; cmd_apply "$*" ;;
+  --apply-auto)     cmd_apply_auto ;;
   --list-combined)  cmd_list_combined ;;
   --list-saved)     cmd_list_fav ;;
   --list-fav)       cmd_list_fav ;;

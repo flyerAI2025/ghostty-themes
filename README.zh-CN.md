@@ -20,17 +20,18 @@
 <p align="center">
   <img src="demo.gif" alt="ghostty-themes 演示" width="800">
   <br>
-  <sub>真实交互录制：输入 <code>git</code>，用 <code>↑/↓</code> 浏览，在深浅主题间切换并各保存一个，再在两个已保存主题之间切换，跳过一个主题，最后应用当前选择。</sub>
+  <sub>真实交互录制：输入 <code>git</code>，用 <code>↑/↓</code> 浏览，各保存一个深色和一个浅色主题，跳过一个主题，在两个已保存主题之间切换，最后应用当前选择。</sub>
 </p>
 
 ## 功能
 
 - **实时预览** — 浏览时主题即时应用到终端
-- **Save 区** — `Ctrl-F` 保存当前主题，已保存主题固定在顶部
-- **Skip 区** — `Ctrl-D` 跳过当前主题，已跳过主题沉到底部并带删除线标记
+- **保存区** — `Ctrl-F` 保存当前主题，已保存主题固定在顶部
+- **跳过区** — `Ctrl-D` 跳过当前主题，已跳过主题沉到底部并带删除线标记
 - **快速筛选** — Save / Skip 之后，焦点会继续停在下一个未标记主题上
 - **代码预览面板** — 语法高亮的 Zig 代码、更明显的 16 色调色板 chips、文字样式，以及 selection / cursor 焦点 chips；整体更适合真实终端使用，同时尽量贴近 [`ghostty +list-themes`](https://github.com/ghostty-org/ghostty/blob/main/src/cli/list_themes.zig)
 - **安全取消** — Esc / Ctrl-C 恢复原主题，不会误改配置
+- **跟随系统外观自动切换** — 一旦已保存的亮/暗主题都拥有 usage history，确认一个已保存主题时就会自动写入 Ghostty 原生 `light:...,dark:...`；`--apply-auto` 仍可手动强制刷新
 - **单文件** — 一个脚本，无需配置，无需编译
 
 ## 系统要求
@@ -85,6 +86,7 @@ ghostty-themes
 
 ```bash
 ghostty-themes --apply "Catppuccin Frappe"   # 直接应用指定主题
+ghostty-themes --apply-auto                  # 写入 Ghostty 原生 light/dark 自动切换配置
 ghostty-themes --preview "Dracula"           # 渲染预览（fzf 内部调用）
 ghostty-themes --list-saved                  # 列出已保存主题
 ghostty-themes --save "Dracula"              # 保存主题
@@ -97,6 +99,15 @@ ghostty-themes --help
 
 兼容旧参数：`--list-fav`、`--add-fav`、`--rm-fav` 仍然可用。
 
+### 系统外观自动切换
+
+当你已保存的主题里同时存在“用过的亮主题”和“用过的暗主题”后，使用 `Enter` 或 `--apply` 确认一个已保存主题时，`ghostty-themes` 会自动写入 Ghostty 原生的 `theme = light:...,dark:...` 配置。它挑选的是：
+
+- 使用次数最多的已保存亮主题
+- 使用次数最多的已保存暗主题
+
+使用次数只会在你最终保留某个主题时增加，也就是按 `Enter` 确认，或直接执行 `--apply`。浏览过程中的实时预览不会计数。未保存主题仍然会作为显式手动覆盖，不会强行切回自动模式。`--apply-auto` 仍然可用于立刻手动强制刷新。如果你还没有“已保存且用过的亮主题”和“已保存且用过的暗主题”各至少一个，自动切换逻辑会直接退出，不会改你的配置。
+
 ### 配置
 
 | 变量 | 默认值 | 说明 |
@@ -107,6 +118,7 @@ ghostty-themes --help
 
 已保存主题保存在 `~/Library/Application Support/com.mitchellh.ghostty/theme-favorites`（纯文本、自动排序、每行一个主题名）。
 已跳过主题保存在 `~/Library/Application Support/com.mitchellh.ghostty/theme-skipped`（纯文本、自动排序、每行一个主题名）。
+主题使用次数保存在 `~/Library/Application Support/com.mitchellh.ghostty/theme-usage`（纯文本，每行一条 `theme<TAB>count` 记录）。
 
 `auto` 保持稳定的 fullscreen 布局。`panel` 作为手动兜底模式保留，适合个别对全屏 TUI 渲染不稳定的终端环境。
 `auto` 重载模式会优先使用 Ghostty 的 AppleScript `reload_config` 动作；如果不可用，再回退到 `⌘⇧,` 快捷键。
@@ -135,13 +147,20 @@ ghostty +list-themes ──▶ fzf ──▶ 选择主题
 2. 传入 fzf，`--preview` 使用 ANSI 24-bit 真彩色渲染主题调色板 — 内容和[颜色映射](https://github.com/ghostty-org/ghostty/blob/main/src/cli/list_themes.zig)与 Ghostty 内置预览完全一致
 3. 每次焦点切换时，更新配置文件中的 `theme = ...`，并优先通过 AppleScript `reload_config` 重新加载 Ghostty（`auto` 模式下才会回退到 `⌘⇧,`）
 4. `Ctrl-F` 保存、`Ctrl-D` 跳过；两者都会即时写盘、立刻重排列表，并把焦点留在下一个未标记主题
-5. Esc / Ctrl-C 恢复原主题；Enter 保留当前选择
+5. Esc / Ctrl-C 恢复原主题；Enter 保留当前选择，并给最终主题累计一次使用次数
+6. 一旦亮/暗两侧的 saved usage history 都具备，确认一个已保存主题时会自动切换成 Ghostty 原生 `light:...,dark:...`，来源是已保存主题里使用次数最高的亮/暗候选
+7. `--apply-auto` 可在需要时手动强制刷新同一套结果
 
 ## 常见问题
 
 **`fzf not found`** — 执行 `brew install fzf` 安装。
 
 **主题没有实时生效** — Ghostty 1.3+ 体验最佳，因为脚本可直接调用它的 AppleScript `reload_config` 动作。较旧环境可试试 `GHOSTTY_THEMES_RELOAD_MODE=shortcut ghostty-themes`。
+
+**系统外观自动切换还没生效** — 这是预期行为，说明你目前还缺下面任一条件：
+
+- 至少一个“已保存且明确应用过”的亮主题
+- 至少一个“已保存且明确应用过”的暗主题
 
 **预览看起来是灰的** — `ghostty-themes` 会有意绕开全局 `NO_COLOR`，否则调色板 chips 和语法颜色会一起被压掉。如果你平时导出了 `NO_COLOR=1`，这里仍然显示颜色是预期行为。
 
@@ -160,6 +179,14 @@ ghostty +list-themes ──▶ fzf ──▶ 选择主题
 ```bash
 rm ~/.local/bin/ghostty-themes          # 删除符号链接
 rm -rf <你克隆仓库的目录>                  # 例如 rm -rf ~/ghostty-themes
+```
+
+如需同时清除保存的偏好和使用数据：
+
+```bash
+rm -f ~/Library/Application\ Support/com.mitchellh.ghostty/theme-favorites \
+      ~/Library/Application\ Support/com.mitchellh.ghostty/theme-skipped \
+      ~/Library/Application\ Support/com.mitchellh.ghostty/theme-usage
 ```
 
 ## 贡献

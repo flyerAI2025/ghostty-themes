@@ -87,13 +87,31 @@ for theme in \
   "Ayu Light" \
   "Ayu Mirage" \
   "Solarized Dark Higher Contrast"; do
-  cat > "$theme_dir/$theme" <<'EOF'
-background = #0f1115
-foreground = #d4d7dd
-cursor-color = #ffd866
-cursor-text = #0f1115
-selection-background = #3b4252
-selection-foreground = #eceff4
+  case "$theme" in
+    "Aardvark Blue"|"Ayu Light")
+      background="#f5f7fb"
+      foreground="#202631"
+      cursor_color="#3a7afe"
+      cursor_text="#f5f7fb"
+      selection_background="#d9e6ff"
+      selection_foreground="#202631"
+      ;;
+    *)
+      background="#0f1115"
+      foreground="#d4d7dd"
+      cursor_color="#ffd866"
+      cursor_text="#0f1115"
+      selection_background="#3b4252"
+      selection_foreground="#eceff4"
+      ;;
+  esac
+  cat > "$theme_dir/$theme" <<EOF
+background = $background
+foreground = $foreground
+cursor-color = $cursor_color
+cursor-text = $cursor_text
+selection-background = $selection_background
+selection-foreground = $selection_foreground
 palette = 0=#101216
 palette = 1=#ff5f56
 palette = 2=#69b36d
@@ -140,7 +158,8 @@ assert_match() {
 reset_lists() {
   rm -f \
     "$HOME/Library/Application Support/com.mitchellh.ghostty/theme-favorites" \
-    "$HOME/Library/Application Support/com.mitchellh.ghostty/theme-skipped"
+    "$HOME/Library/Application Support/com.mitchellh.ghostty/theme-skipped" \
+    "$HOME/Library/Application Support/com.mitchellh.ghostty/theme-usage"
 }
 
 combined_pairs() {
@@ -198,6 +217,81 @@ if grep -q '^theme *=' "$config_file" 2>/dev/null; then
   print -u2 "FAIL: apply with empty theme should remove theme line"
   exit 1
 fi
+
+reset_lists
+blocked_config="$tmp_root/blocked-config"
+mkdir -p "$blocked_config"
+if GHOSTTY_CONFIG="$blocked_config" "$SCRIPT" --apply "Ayu Light" >"$tmp_root/blocked.stdout" 2>"$tmp_root/blocked.stderr"; then
+  print -u2 "FAIL: apply with an unwritable config path should exit non-zero"
+  exit 1
+fi
+if [[ -f "$HOME/Library/Application Support/com.mitchellh.ghostty/theme-usage" ]]; then
+  print -u2 "FAIL: failed apply should not create usage history"
+  exit 1
+fi
+
+reset_lists
+"$SCRIPT" --save "Ayu Light"
+"$SCRIPT" --save "Ayu Mirage"
+"$SCRIPT" --apply "Ayu Mirage"
+assert_eq 'theme = Ayu Mirage' "$(grep '^theme *= ' "$config_file")" \
+  "saved apply should stay explicit until both light and dark saved themes have usage history"
+"$SCRIPT" --apply "Ayu Light"
+assert_eq 'theme = light:Ayu Light,dark:Ayu Mirage' "$(grep '^theme *= ' "$config_file")" \
+  "saved apply should automatically switch to Ghostty's native light/dark pair once both saved appearances have usage history"
+usage_before_preview="$(cat "$HOME/Library/Application Support/com.mitchellh.ghostty/theme-usage")"
+"$SCRIPT" --apply-preview "Ayu"
+assert_eq 'theme = Ayu' "$(grep '^theme *= ' "$config_file")" \
+  "apply-preview should still write the explicitly previewed theme"
+assert_eq "$usage_before_preview" "$(cat "$HOME/Library/Application Support/com.mitchellh.ghostty/theme-usage")" \
+  "apply-preview should not record usage or auto-enable system appearance switching"
+"$SCRIPT" --apply "Ayu"
+assert_eq 'theme = Ayu' "$(grep '^theme *= ' "$config_file")" \
+  "unsaved apply should remain explicit even when auto-switch candidates exist"
+
+reset_lists
+"$SCRIPT" --save "Ayu Mirage"
+"$SCRIPT" --save "Solarized Dark Higher Contrast"
+"$SCRIPT" --apply "Ayu Mirage"
+assert_eq 'theme = Ayu Mirage' "$(grep '^theme *= ' "$config_file")" \
+  "all-dark saved themes should not auto-enable system appearance switching"
+"$SCRIPT" --apply "Solarized Dark Higher Contrast"
+assert_eq 'theme = Solarized Dark Higher Contrast' "$(grep '^theme *= ' "$config_file")" \
+  "saved apply should stay explicit when there is still no saved light candidate"
+
+reset_lists
+"$SCRIPT" --save "Aardvark Blue"
+"$SCRIPT" --save "Ayu Light"
+"$SCRIPT" --save "Ayu Mirage"
+"$SCRIPT" --save "Solarized Dark Higher Contrast"
+"$SCRIPT" --apply "Ayu Light"
+"$SCRIPT" --apply "Aardvark Blue"
+"$SCRIPT" --apply "Aardvark Blue"
+"$SCRIPT" --apply "Solarized Dark Higher Contrast"
+"$SCRIPT" --apply "Ayu Mirage"
+"$SCRIPT" --apply "Ayu Mirage"
+"$SCRIPT" --apply "Ayu Mirage"
+"$SCRIPT" --apply-auto
+assert_eq 'theme = light:Aardvark Blue,dark:Ayu Mirage' "$(grep '^theme *= ' "$config_file")" \
+  "apply-auto should write Ghostty's native light/dark pair from the top saved usage picks"
+
+reset_lists
+"$SCRIPT" --save "Ayu Mirage"
+"$SCRIPT" --save "Solarized Dark Higher Contrast"
+"$SCRIPT" --apply "Ayu Mirage"
+"$SCRIPT" --apply "Ayu Mirage"
+auto_stdout="$tmp_root/auto-theme.stdout"
+auto_stderr="$tmp_root/auto-theme.stderr"
+if "$SCRIPT" --apply-auto >"$auto_stdout" 2>"$auto_stderr"; then
+  print -u2 "FAIL: apply-auto without a saved light theme should exit non-zero"
+  exit 1
+fi
+assert_eq 'theme = Ayu Mirage' "$(grep '^theme *= ' "$config_file")" \
+  "apply-auto should leave config unchanged when the saved auto-switch conditions are incomplete"
+assert_eq 'Auto theme unavailable: no saved light theme with usage history' "$(cat "$auto_stderr")" \
+  "apply-auto should explain why it skipped the config update"
+assert_eq '' "$(cat "$auto_stdout")" \
+  "apply-auto should stay quiet on stdout when it cannot update config"
 
 preview_output="$(NO_COLOR=1 "$SCRIPT" --preview "Ayu")"
 assert_match $'\033\\[(38|48);2;' "$preview_output" \

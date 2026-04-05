@@ -20,7 +20,7 @@
 <p align="center">
   <img src="demo.gif" alt="ghostty-themes demo" width="800">
   <br>
-  <sub>Real interaction capture: type <code>git</code>, browse with <code>↑/↓</code>, save one light and one dark theme, switch between the saved picks, skip one theme, then apply.</sub>
+  <sub>Real interaction capture: type <code>git</code>, browse with <code>↑/↓</code>, save one dark and one light theme, skip one theme, switch between the saved picks, then apply.</sub>
 </p>
 
 ## Features
@@ -31,6 +31,7 @@
 - **Fast triage** — after Save or Skip, focus advances to the next unmarked theme
 - **Code preview panel** — syntax-highlighted Zig, larger 16-color palette chips, text styles, and focus chips for selection / cursor colors — tuned for real terminal use while staying close to [`ghostty +list-themes`](https://github.com/ghostty-org/ghostty/blob/main/src/cli/list_themes.zig)
 - **Cancel-safe** — Esc / Ctrl-C restores your original theme
+- **System appearance auto-switch** — once your saved light and dark themes both have usage history, confirming a saved theme automatically writes Ghostty's native `light:...,dark:...` pair; `--apply-auto` remains available as a manual refresh
 - **Single file** — one script, no config, no build step
 
 ## Requirements
@@ -85,6 +86,7 @@ Saved themes appear at the top of the list. Skipped themes stay at the bottom an
 
 ```bash
 ghostty-themes --apply "Catppuccin Frappe"   # apply a theme directly
+ghostty-themes --apply-auto                  # write Ghostty's native light/dark auto pair
 ghostty-themes --preview "Dracula"           # render preview (used by fzf)
 ghostty-themes --list-saved                  # list saved themes
 ghostty-themes --save "Dracula"              # save a theme
@@ -97,6 +99,15 @@ ghostty-themes --help
 
 Legacy aliases `--list-fav`, `--add-fav`, and `--rm-fav` still work.
 
+### System Auto Theme
+
+Once your saved themes include both a used light theme and a used dark theme, confirming a saved theme with `Enter` or `--apply` automatically writes Ghostty's native `theme = light:...,dark:...` config using:
+
+- the most-used saved light theme
+- the most-used saved dark theme
+
+Usage counts are recorded only when a theme is explicitly kept with `Enter` or `--apply`. Live preview while browsing does not count. Unsaved themes remain explicit manual overrides. `--apply-auto` is still available if you want to force a refresh immediately. If you don't yet have both a saved light theme and a saved dark theme with usage history, the auto-switch logic exits without changing your config.
+
 ### Configuration
 
 | Variable | Default | Description |
@@ -107,6 +118,7 @@ Legacy aliases `--list-fav`, `--add-fav`, and `--rm-fav` still work.
 
 Saved themes are stored in `~/Library/Application Support/com.mitchellh.ghostty/theme-favorites` (plain text, sorted, one theme name per line).
 Skipped themes are stored in `~/Library/Application Support/com.mitchellh.ghostty/theme-skipped` (plain text, sorted, one theme name per line).
+Theme usage counts are stored in `~/Library/Application Support/com.mitchellh.ghostty/theme-usage` (plain text, one `theme<TAB>count` entry per line).
 
 `auto` keeps the stable fullscreen layout. `panel` remains available as a manual fallback for terminals that render fullscreen TUIs poorly.
 `auto` reload mode prefers Ghostty's AppleScript `reload_config` action and falls back to the `⌘⇧,` shortcut for older setups.
@@ -136,13 +148,20 @@ ghostty +list-themes ──▶ fzf ──▶ select theme
 2. Pipes into fzf with `--preview` rendering the palette using ANSI 24-bit true color — same content and [color mapping](https://github.com/ghostty-org/ghostty/blob/main/src/cli/list_themes.zig) as Ghostty's built-in preview
 3. On each focus change, updates `theme = ...` in your config and reloads Ghostty via AppleScript `reload_config` (with `⌘⇧,` fallback in `auto` mode)
 4. Ctrl-F saves and Ctrl-D skips; both persist instantly, reorder the list, and keep focus on the next unmarked theme
-5. Esc / Ctrl-C restores the original theme; Enter keeps the selection
+5. Esc / Ctrl-C restores the original theme; Enter keeps the selection and records one usage for the final theme
+6. Once both saved appearances have usage history, confirming a saved theme automatically switches config to Ghostty's native `light:...,dark:...` pair using the most-used saved light/dark themes
+7. `--apply-auto` can force that same refresh on demand
 
 ## Troubleshooting
 
 **`fzf not found`** — Install: `brew install fzf`.
 
 **Themes don't apply in real-time** — Ghostty 1.3+ works best because the script can call its AppleScript `reload_config` action directly. On older setups, try `GHOSTTY_THEMES_RELOAD_MODE=shortcut ghostty-themes`.
+
+**System auto-switch hasn't kicked in yet** — This is expected until you have both:
+
+- a saved light theme that you've explicitly applied before
+- a saved dark theme that you've explicitly applied before
 
 **Preview looks grayscale** — `ghostty-themes` intentionally bypasses global `NO_COLOR` settings so palette chips and syntax colors remain visible. If you've exported `NO_COLOR=1`, that's expected: the picker still renders colors on purpose.
 
@@ -161,6 +180,14 @@ This tool addresses several long-standing requests in the Ghostty community:
 ```bash
 rm ~/.local/bin/ghostty-themes          # remove symlink
 rm -rf <directory-where-you-cloned>     # e.g. rm -rf ~/ghostty-themes
+```
+
+To also remove saved preferences and usage data:
+
+```bash
+rm -f ~/Library/Application\ Support/com.mitchellh.ghostty/theme-favorites \
+      ~/Library/Application\ Support/com.mitchellh.ghostty/theme-skipped \
+      ~/Library/Application\ Support/com.mitchellh.ghostty/theme-usage
 ```
 
 ## Contributing
